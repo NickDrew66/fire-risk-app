@@ -2,162 +2,296 @@
 <html lang="en-GB">
 <head>
   <meta charset="UTF-8">
-  <!-- Makes the page scale properly on phones and tablets -->
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Fire Risk Notes - Step 1</title>
+  <title>Fire Risk Assessor - Step 2</title>
 
   <style>
-    /* Plain, readable styling. Big tap targets because this will be used on site. */
-    body {
-      font-family: system-ui, sans-serif;
-      max-width: 640px;
-      margin: 0 auto;
-      padding: 16px;
-      line-height: 1.4;
-    }
-    textarea {
-      width: 100%;
-      box-sizing: border-box;
-      font: inherit;
-      padding: 10px;
-      min-height: 110px;
-    }
-    button {
-      font: inherit;
-      padding: 12px 20px;
-      margin-top: 8px;
-      cursor: pointer;
-    }
-    #status { color: #555; min-height: 1.4em; }
-    ul { list-style: none; padding: 0; }
-    li {
-      border: 1px solid #bbb;
-      border-radius: 6px;
-      padding: 10px;
-      margin-bottom: 10px;
-    }
-    .when { font-size: 0.85rem; color: #555; }
-    .delete { background: none; border: none; color: #b00020; padding: 4px 0; margin: 0; }
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 16px; line-height: 1.4; }
+    input[type=text] { font: inherit; padding: 10px; width: 100%; box-sizing: border-box; }
+    button, .btn { font: inherit; padding: 12px 20px; margin-top: 8px; cursor: pointer; display: inline-block; }
+    .btn { border: 1px solid #767676; border-radius: 4px; background: #efefef; }
+    .link-btn { background: none; border: none; color: #b00020; padding: 4px 0; margin: 0; }
+    .muted { color: #555; font-size: 0.9rem; }
+    ul.items { list-style: none; padding: 0; }
+    ul.items li { border: 1px solid #bbb; border-radius: 6px; padding: 10px; margin-bottom: 10px; }
+    ul.items a { font-weight: 600; font-size: 1.1rem; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; padding: 0; list-style: none; }
+    .grid li { border: 1px solid #bbb; border-radius: 6px; padding: 8px; }
+    .grid img { width: 100%; height: auto; display: block; border-radius: 4px; }
+    .back { display: inline-block; margin-bottom: 8px; }
+    #photo-input { display: none; } /* the label below acts as the visible button */
   </style>
 </head>
 <body>
+  <main id="app"></main>
 
-  <h1>Findings</h1>
-
-  <label for="note">Description</label>
-  <textarea id="note" placeholder="e.g. Fire door to plant room wedged open"></textarea>
-  <button id="save">Save finding</button>
-  <p id="status"></p>
-
-  <h2>Saved findings</h2>
-  <ul id="list"></ul>
-
-  <!-- Dexie is a small library that makes IndexedDB (the browser's built-in
-       database) much easier to use. This loads it from the internet.
-       In step 4 we'll cache it so it also works with no signal. -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/dexie/3.2.7/dexie.min.js"></script>
-
   <script>
-    // ---------------------------------------------------------------
+    // ===============================================================
     // 1. DATABASE
-    // Create (or open) a database called "fireRiskApp" stored on the device.
-    // "findings" is like a table. The text after it lists the fields we
-    // want to be able to search/sort on:
-    //   ++id    = auto-numbering primary key
-    //   created = date/time saved
-    // We can still store other fields (like "description") without listing them.
-    // ---------------------------------------------------------------
-    const db = new Dexie("fireRiskApp");
+    // Three tables, linked by ID numbers (like foreign keys in SQL):
+    //   assessments : one per building/site visit
+    //   sections    : areas inside an assessment (a door, stairwell...)
+    //                 "assessmentId" says which assessment it belongs to
+    //   photos      : pictures inside a section
+    //                 "sectionId" says which section it belongs to
+    // New database name, so it doesn't clash with step 1's data.
+    // ===============================================================
+    const db = new Dexie("fireRiskAssessor");
     db.version(1).stores({
-      findings: "++id, created"
+      assessments: "++id, created",
+      sections:    "++id, assessmentId, created",
+      photos:      "++id, sectionId, created"
     });
 
-    // ---------------------------------------------------------------
-    // 2. GRAB THE PAGE ELEMENTS WE NEED
-    // Similar to putting objects in variables in PowerShell.
-    // ---------------------------------------------------------------
-    const noteBox  = document.getElementById("note");
-    const saveBtn  = document.getElementById("save");
-    const statusEl = document.getElementById("status");
-    const listEl   = document.getElementById("list");
+    // Ask the browser not to delete our data when the device is short of
+    // space. It may refuse, which is fine - it's a request, not a demand.
+    if (navigator.storage && navigator.storage.persist) {
+      navigator.storage.persist();
+    }
 
-    // ---------------------------------------------------------------
-    // 3. SAVE A FINDING
-    // "async/await" is how JavaScript waits for slow operations
-    // (like writing to the database) without freezing the page.
-    // ---------------------------------------------------------------
-    async function saveFinding() {
-      const text = noteBox.value.trim();
+    // ===============================================================
+    // 2. SMALL HELPERS
+    // ===============================================================
+    const app = document.getElementById("app");
 
-      if (text === "") {
-        statusEl.textContent = "Type a description first.";
-        return;
+    // el("button", {onclick: fn}, "Text")  builds an element in one line.
+    function el(tag, attrs = {}, ...children) {
+      const node = document.createElement(tag);
+      for (const [key, value] of Object.entries(attrs)) {
+        if (key === "class") node.className = value;
+        else if (key.startsWith("on")) node.addEventListener(key.slice(2), value);
+        else node.setAttribute(key, value);
       }
+      node.append(...children);
+      return node;
+    }
+
+    const fmtDate = iso => new Date(iso).toLocaleString("en-GB");
+    const fmtKB   = bytes => Math.round(bytes / 1024) + " KB";
+
+    // Thumbnails use temporary URLs that point at the stored image data.
+    // We keep a list so we can release them when the screen changes.
+    let objectUrls = [];
+    function releaseUrls() {
+      objectUrls.forEach(u => URL.revokeObjectURL(u));
+      objectUrls = [];
+    }
+
+    // ===============================================================
+    // 3. IMAGE RESIZING
+    // Takes the full phone photo, scales it down so the longest side
+    // is 1600px, and re-saves it as a JPEG at 75% quality.
+    // A 5MB photo usually becomes 200-500KB.
+    // ===============================================================
+    async function resizeImage(file, maxEdge = 1600, quality = 0.75) {
+      // imageOrientation stops phone photos appearing sideways
+      const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+
+      const scale  = Math.min(1, maxEdge / Math.max(bitmap.width, bitmap.height));
+      const width  = Math.round(bitmap.width * scale);
+      const height = Math.round(bitmap.height * scale);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext("2d").drawImage(bitmap, 0, 0, width, height);
+      bitmap.close();
+
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, "image/jpeg", quality));
+      return { blob, width, height };
+    }
+
+    // ===============================================================
+    // 4. SCREENS
+    // The page "address" (the part after the #) decides which one shows:
+    //   #/          home: list of assessments
+    //   #/a/5       assessment 5: its sections
+    //   #/s/12      section 12: its photos
+    // Using addresses means the phone's Back button works for free.
+    // ===============================================================
+
+    // ---- Home: assessments ----
+    async function showHome() {
+      const nameInput = el("input", { type: "text", id: "name", placeholder: "Building / location, e.g. Riverside House, Solihull" });
+
+      async function create() {
+        const name = nameInput.value.trim();
+        if (!name) return;
+        const id = await db.assessments.add({ name, created: new Date().toISOString() });
+        location.hash = "#/a/" + id;   // jump straight into the new assessment
+      }
+
+      const list = el("ul", { class: "items" });
+      const all = await db.assessments.orderBy("created").reverse().toArray();
+      if (all.length === 0) list.append(el("li", {}, "No assessments yet."));
+
+      for (const a of all) {
+        const sectionCount = await db.sections.where("assessmentId").equals(a.id).count();
+        list.append(el("li", {},
+          el("a", { href: "#/a/" + a.id }, a.name),
+          el("div", { class: "muted" }, fmtDate(a.created) + " - " + sectionCount + " section(s)"),
+          el("button", { class: "link-btn", onclick: () => deleteAssessment(a) }, "Delete")
+        ));
+      }
+
+      app.replaceChildren(
+        el("h1", {}, "Assessments"),
+        nameInput,
+        el("button", { onclick: create }, "Start new assessment"),
+        list
+      );
+    }
+
+    async function deleteAssessment(a) {
+      if (!confirm("Delete '" + a.name + "' and everything in it?")) return;
+      // A transaction means "do all of this or none of it".
+      await db.transaction("rw", db.assessments, db.sections, db.photos, async () => {
+        const sections = await db.sections.where("assessmentId").equals(a.id).toArray();
+        for (const s of sections) await db.photos.where("sectionId").equals(s.id).delete();
+        await db.sections.where("assessmentId").equals(a.id).delete();
+        await db.assessments.delete(a.id);
+      });
+      showHome();
+    }
+
+    // ---- Assessment: sections ----
+    async function showAssessment(id) {
+      const assessment = await db.assessments.get(id);
+      if (!assessment) { location.hash = "#/"; return; }
+
+      const nameInput = el("input", { type: "text", placeholder: "Section, e.g. Stairwell B, Main electrical panel" });
+
+      async function addSection() {
+        const name = nameInput.value.trim();
+        if (!name) return;
+        const sid = await db.sections.add({ assessmentId: id, name, created: new Date().toISOString() });
+        location.hash = "#/s/" + sid;  // straight into the new section, ready for photos
+      }
+
+      const list = el("ul", { class: "items" });
+      const sections = await db.sections.where("assessmentId").equals(id).sortBy("created");
+      if (sections.length === 0) list.append(el("li", {}, "No sections yet."));
+
+      for (const s of sections) {
+        const photoCount = await db.photos.where("sectionId").equals(s.id).count();
+        list.append(el("li", {},
+          el("a", { href: "#/s/" + s.id }, s.name),
+          el("div", { class: "muted" }, photoCount + " photo(s)"),
+          el("button", { class: "link-btn", onclick: () => deleteSection(s) }, "Delete")
+        ));
+      }
+
+      app.replaceChildren(
+        el("a", { href: "#/", class: "back" }, "< All assessments"),
+        el("h1", {}, assessment.name),
+        el("p", { class: "muted" }, fmtDate(assessment.created)),
+        nameInput,
+        el("button", { onclick: addSection }, "Add section"),
+        list
+      );
+    }
+
+    async function deleteSection(s) {
+      if (!confirm("Delete '" + s.name + "' and its photos?")) return;
+      await db.transaction("rw", db.sections, db.photos, async () => {
+        await db.photos.where("sectionId").equals(s.id).delete();
+        await db.sections.delete(s.id);
+      });
+      showAssessment(s.assessmentId);
+    }
+
+    // ---- Section: photos ----
+    async function showSection(id) {
+      const section = await db.sections.get(id);
+      if (!section) { location.hash = "#/"; return; }
+
+      const status = el("p", { class: "muted" }, "");
+
+      // Hidden file input. On a phone, capture="environment" opens the
+      // rear camera directly. On a PC it opens a file picker instead,
+      // which is handy for testing.
+      const input = el("input", { type: "file", accept: "image/*", capture: "environment", id: "photo-input" });
+      input.addEventListener("change", async () => {
+        const file = input.files[0];
+        if (!file) return;
+        status.textContent = "Processing photo...";
+        try {
+          const { blob, width, height } = await resizeImage(file);
+          await db.photos.add({
+            sectionId: id,
+            created: new Date().toISOString(),
+            blob, width, height,
+            // Placeholders for later steps, so we won't need to restructure:
+            tags: [],
+            note: "",
+            voiceNoteId: null
+          });
+          status.textContent = "Saved (" + fmtKB(file.size) + " reduced to " + fmtKB(blob.size) + ").";
+        } catch (err) {
+          console.error(err);
+          status.textContent = "Could not save photo: " + err.message;
+        }
+        input.value = "";           // lets the same file be chosen again
+        renderPhotos();
+      });
+
+      const grid = el("ul", { class: "grid" });
+
+      async function renderPhotos() {
+        releaseUrls();
+        grid.replaceChildren();
+        const photos = await db.photos.where("sectionId").equals(id).sortBy("created");
+        if (photos.length === 0) grid.append(el("li", {}, "No photos yet."));
+
+        for (const p of photos) {
+          const url = URL.createObjectURL(p.blob);
+          objectUrls.push(url);
+          grid.append(el("li", {},
+            el("img", { src: url, alt: "Photo taken " + fmtDate(p.created) }),
+            el("div", { class: "muted" }, fmtDate(p.created) + " - " + fmtKB(p.blob.size)),
+            el("button", { class: "link-btn", onclick: async () => {
+              if (!confirm("Delete this photo?")) return;
+              await db.photos.delete(p.id);
+              renderPhotos();
+            } }, "Delete")
+          ));
+        }
+      }
+
+      app.replaceChildren(
+        el("a", { href: "#/a/" + section.assessmentId, class: "back" }, "< Back to sections"),
+        el("h1", {}, section.name),
+        input,
+        el("label", { class: "btn", for: "photo-input" }, "Take photo"),
+        status,
+        grid
+      );
+      renderPhotos();
+    }
+
+    // ===============================================================
+    // 5. ROUTER
+    // Reads the address after the # and shows the matching screen.
+    // ===============================================================
+    async function route() {
+      releaseUrls();
+      const parts = location.hash.replace(/^#\/?/, "").split("/");   // "a/5" -> ["a", "5"]
+      const [kind, rawId] = parts;
+      const id = Number(rawId);
 
       try {
-        // .add() is like adding a row. The object in { } is the record.
-        await db.findings.add({
-          description: text,
-          created: new Date().toISOString()
-        });
-
-        noteBox.value = "";
-        statusEl.textContent = "Saved on this device.";
-        await showFindings();
+        if (kind === "a" && id) await showAssessment(id);
+        else if (kind === "s" && id) await showSection(id);
+        else await showHome();
       } catch (err) {
-        // Always handle errors. Storage can fail (e.g. device full).
         console.error(err);
-        statusEl.textContent = "Could not save: " + err.message;
+        app.replaceChildren(el("p", {}, "Something went wrong: " + err.message));
       }
     }
 
-    // ---------------------------------------------------------------
-    // 4. SHOW ALL SAVED FINDINGS
-    // ---------------------------------------------------------------
-    async function showFindings() {
-      // Get everything, newest first
-      const all = await db.findings.orderBy("created").reverse().toArray();
-
-      listEl.innerHTML = "";   // clear the list before rebuilding it
-
-      if (all.length === 0) {
-        listEl.innerHTML = "<li>No findings saved yet.</li>";
-        return;
-      }
-
-      // Loop through the records, like foreach in PowerShell
-      for (const item of all) {
-        const li = document.createElement("li");
-
-        // Using textContent (not innerHTML) for user text is safer,
-        // because it can't be misread as HTML code.
-        const desc = document.createElement("div");
-        desc.textContent = item.description;
-
-        const when = document.createElement("div");
-        when.className = "when";
-        when.textContent = new Date(item.created).toLocaleString("en-GB");
-
-        const del = document.createElement("button");
-        del.className = "delete";
-        del.textContent = "Delete";
-        del.addEventListener("click", async () => {
-          await db.findings.delete(item.id);
-          await showFindings();
-        });
-
-        li.append(desc, when, del);
-        listEl.appendChild(li);
-      }
-    }
-
-    // ---------------------------------------------------------------
-    // 5. WIRE IT UP
-    // When Save is clicked, run saveFinding. When the page first loads,
-    // show whatever is already stored.
-    // ---------------------------------------------------------------
-    saveBtn.addEventListener("click", saveFinding);
-    showFindings();
+    window.addEventListener("hashchange", route);
+    route();
   </script>
 </body>
 </html>
