@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+  <meta charset="UTF-8">
+  <!-- Makes the page scale properly on phones and tablets -->
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fire Risk Notes - Step 1</title>
+
+  <style>
+    /* Plain, readable styling. Big tap targets because this will be used on site. */
+    body {
+      font-family: system-ui, sans-serif;
+      max-width: 640px;
+      margin: 0 auto;
+      padding: 16px;
+      line-height: 1.4;
+    }
+    textarea {
+      width: 100%;
+      box-sizing: border-box;
+      font: inherit;
+      padding: 10px;
+      min-height: 110px;
+    }
+    button {
+      font: inherit;
+      padding: 12px 20px;
+      margin-top: 8px;
+      cursor: pointer;
+    }
+    #status { color: #555; min-height: 1.4em; }
+    ul { list-style: none; padding: 0; }
+    li {
+      border: 1px solid #bbb;
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 10px;
+    }
+    .when { font-size: 0.85rem; color: #555; }
+    .delete { background: none; border: none; color: #b00020; padding: 4px 0; margin: 0; }
+  </style>
+</head>
+<body>
+
+  <h1>Findings</h1>
+
+  <label for="note">Description</label>
+  <textarea id="note" placeholder="e.g. Fire door to plant room wedged open"></textarea>
+  <button id="save">Save finding</button>
+  <p id="status"></p>
+
+  <h2>Saved findings</h2>
+  <ul id="list"></ul>
+
+  <!-- Dexie is a small library that makes IndexedDB (the browser's built-in
+       database) much easier to use. This loads it from the internet.
+       In step 4 we'll cache it so it also works with no signal. -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/dexie/3.2.7/dexie.min.js"></script>
+
+  <script>
+    // ---------------------------------------------------------------
+    // 1. DATABASE
+    // Create (or open) a database called "fireRiskApp" stored on the device.
+    // "findings" is like a table. The text after it lists the fields we
+    // want to be able to search/sort on:
+    //   ++id    = auto-numbering primary key
+    //   created = date/time saved
+    // We can still store other fields (like "description") without listing them.
+    // ---------------------------------------------------------------
+    const db = new Dexie("fireRiskApp");
+    db.version(1).stores({
+      findings: "++id, created"
+    });
+
+    // ---------------------------------------------------------------
+    // 2. GRAB THE PAGE ELEMENTS WE NEED
+    // Similar to putting objects in variables in PowerShell.
+    // ---------------------------------------------------------------
+    const noteBox  = document.getElementById("note");
+    const saveBtn  = document.getElementById("save");
+    const statusEl = document.getElementById("status");
+    const listEl   = document.getElementById("list");
+
+    // ---------------------------------------------------------------
+    // 3. SAVE A FINDING
+    // "async/await" is how JavaScript waits for slow operations
+    // (like writing to the database) without freezing the page.
+    // ---------------------------------------------------------------
+    async function saveFinding() {
+      const text = noteBox.value.trim();
+
+      if (text === "") {
+        statusEl.textContent = "Type a description first.";
+        return;
+      }
+
+      try {
+        // .add() is like adding a row. The object in { } is the record.
+        await db.findings.add({
+          description: text,
+          created: new Date().toISOString()
+        });
+
+        noteBox.value = "";
+        statusEl.textContent = "Saved on this device.";
+        await showFindings();
+      } catch (err) {
+        // Always handle errors. Storage can fail (e.g. device full).
+        console.error(err);
+        statusEl.textContent = "Could not save: " + err.message;
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // 4. SHOW ALL SAVED FINDINGS
+    // ---------------------------------------------------------------
+    async function showFindings() {
+      // Get everything, newest first
+      const all = await db.findings.orderBy("created").reverse().toArray();
+
+      listEl.innerHTML = "";   // clear the list before rebuilding it
+
+      if (all.length === 0) {
+        listEl.innerHTML = "<li>No findings saved yet.</li>";
+        return;
+      }
+
+      // Loop through the records, like foreach in PowerShell
+      for (const item of all) {
+        const li = document.createElement("li");
+
+        // Using textContent (not innerHTML) for user text is safer,
+        // because it can't be misread as HTML code.
+        const desc = document.createElement("div");
+        desc.textContent = item.description;
+
+        const when = document.createElement("div");
+        when.className = "when";
+        when.textContent = new Date(item.created).toLocaleString("en-GB");
+
+        const del = document.createElement("button");
+        del.className = "delete";
+        del.textContent = "Delete";
+        del.addEventListener("click", async () => {
+          await db.findings.delete(item.id);
+          await showFindings();
+        });
+
+        li.append(desc, when, del);
+        listEl.appendChild(li);
+      }
+    }
+
+    // ---------------------------------------------------------------
+    // 5. WIRE IT UP
+    // When Save is clicked, run saveFinding. When the page first loads,
+    // show whatever is already stored.
+    // ---------------------------------------------------------------
+    saveBtn.addEventListener("click", saveFinding);
+    showFindings();
+  </script>
+</body>
+</html>
