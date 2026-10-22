@@ -46,6 +46,7 @@
 </head>
 <body>
   <main id="app"></main>
+  <p id="sync-badge" class="muted"></p>
 
   <!-- Dexie now loads from your own folder (see the PowerShell download command) -->
   <script src="dexie.min.js"></script>
@@ -65,34 +66,111 @@
         "dexie.min.js was not found. Download it into the same folder as this page.";
       throw new Error("Dexie missing");
     }
-    const db = new Dexie("fireRiskAssessor");
+    // A NEW database name again, because photos and audio are now stored in
+    // a different shape (see below). Test data from earlier versions stays
+    // in the old databases and is simply no longer used.
+    //
+    // Photos and audio are stored as raw bytes (an ArrayBuffer plus the file
+    // type) rather than as a Blob. Safari on iPhone is unreliable at reading
+    // Blobs back out of IndexedDB (missing images, silent audio). Plain
+    // bytes always read back correctly, and we turn them into a Blob only
+    // when we need to display or play them.
+    //
+    // Every record now has:
+    //   id          a UUID (text) made on the device, unique everywhere
+    //   updatedAt   when it last changed
+    //   syncStatus  "pending" (needs uploading) or "synced"
+    //   deleted     true = removed by the user; kept until the server knows
+    const db = new Dexie("fireRiskAssessorV3");
     db.version(1).stores({
-      assessments: "++id, created",
-      sections:    "++id, assessmentId, created",
-      photos:      "++id, sectionId, created"
-    });
-
-    // Version 2 (step 3). Whenever you change the structure you add a new
-    // version number; Dexie upgrades existing data automatically.
-    //   "*tags" on photos = index every item in the tags list, so we can
-    //                       later ask "show all photos tagged fire door".
-    //   customTags        = tags the assessor has invented, so they appear
-    //                       in the pick-list from then on.
-    db.version(2).stores({
-      photos:     "++id, sectionId, created, *tags",
-      customTags: "name"
-    });
-
-    // Version 3 (step 4): voice notes. Each one points at its photo with
-    // "photoId". The audio itself is stored as a blob, like the photos.
-    db.version(3).stores({
-      voiceNotes: "++id, photoId, created"
+      assessments: "id, created, syncStatus",
+      sections:    "id, assessmentId, created, syncStatus",
+      photos:      "id, sectionId, created, syncStatus, *tags",
+      voiceNotes:  "id, photoId, created, syncStatus",
+      customTags:  "name"
     });
 
     // Ask the browser not to delete our data when the device is short of
     // space. It may refuse, which is fine - it's a request, not a demand.
     if (navigator.storage && navigator.storage.persist) {
       navigator.storage.persist();
+    }
+
+    // ===============================================================
+    // 1b. RECORD HELPERS
+    // All saving, changing and deleting goes through these four functions,
+    // so every record is stamped the same way and is flagged "pending"
+    // whenever it changes. The sync step (6d) will upload the pending ones.
+    // ===============================================================
+
+    // A UUID looks like "3f2b8c1e-9d4a-4e0b-a7c1-5b2f6d8e9a10". Two devices
+    // can make IDs without ever clashing, even offline.
+    function newId() {
+      if (crypto.randomUUID) return crypto.randomUUID();
+      // Fallback for browsers/contexts without randomUUID
+      return "10000000-1000-4000-8000-100000000000".replace(/[018]/g, c =>
+        (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
+    }
+
+    const nowIso = () => new Date().toISOString();
+
+    // Add a new record. Returns its new ID.
+    async function saveNew(table, fields) {
+      const now = nowIso();
+      const record = { id: newId(), created: now, updatedAt: now, syncStatus: "pending", deleted: false, ...fields };
+      await table.add(record);
+      updateSyncBadge();
+      return record.id;
+    }
+
+    // Change fields on an existing record and flag it for upload again.
+    async function changeRecord(table, id, changes) {
+      await table.update(id, { ...changes, updatedAt: nowIso(), syncStatus: "pending" });
+      updateSyncBadge();
+    }
+
+    // "Soft" delete: the record is flagged deleted rather than removed, so
+    // the server can be told about it at the next sync. It cascades down
+    // (assessment -> sections -> photos -> voice notes). The photo/audio
+    // data is dropped straight away, so deleting still frees device space.
+    async function softDelete(kind, id) {
+      const mark  = { deleted: true, updatedAt: nowIso(), syncStatus: "pending" };
+      const media = { ...mark, data: null };
+
+      async function markPhoto(photoId) {
+        await db.voiceNotes.where("photoId").equals(photoId).modify(media);
+        await db.photos.update(photoId, media);
+      }
+      async function markSection(sectionId) {
+        const photoIds = await db.photos.where("sectionId").equals(sectionId).primaryKeys();
+        for (const pid of photoIds) await markPhoto(pid);
+        await db.sections.update(sectionId, mark);
+      }
+
+      await db.transaction("rw", db.assessments, db.sections, db.photos, db.voiceNotes, async () => {
+        if (kind === "assessment") {
+          const sectionIds = await db.sections.where("assessmentId").equals(id).primaryKeys();
+          for (const sid of sectionIds) await markSection(sid);
+          await db.assessments.update(id, mark);
+        } else if (kind === "section") {
+          await markSection(id);
+        } else if (kind === "photo") {
+          await markPhoto(id);
+        } else if (kind === "voiceNote") {
+          await db.voiceNotes.update(id, media);
+        }
+      });
+      updateSyncBadge();
+    }
+
+    // Small line at the bottom of the page: how many records are waiting.
+    async function updateSyncBadge() {
+      const badge = document.getElementById("sync-badge");
+      if (!badge) return;
+      const tables = [db.assessments, db.sections, db.photos, db.voiceNotes];
+      const counts = await Promise.all(tables.map(t => t.where("syncStatus").equals("pending").count()));
+      const total = counts.reduce((a, b) => a + b, 0);
+      badge.textContent = total + " record(s) not yet synced";
     }
 
     // ===============================================================
@@ -150,7 +228,7 @@
       const customInput = el("input", { type: "text", placeholder: "Add your own tag" });
 
       async function saveSelected() {
-        await db.photos.update(photo.id, { tags: [...selected] });
+        await changeRecord(db.photos, photo.id, { tags: [...selected] });
       }
 
       // Redraws the summary line and the row of buttons.
@@ -235,7 +313,7 @@
     function noteBox(photo) {
       const box = el("textarea", { placeholder: "Typed note (optional)" });
       box.value = photo.note || "";
-      box.addEventListener("change", () => db.photos.update(photo.id, { note: box.value.trim() }));
+      box.addEventListener("change", () => changeRecord(db.photos, photo.id, { note: box.value.trim() }));
       return box;
     }
 
@@ -247,17 +325,17 @@
       let timer = null;
 
       async function renderNotes() {
-        const notes = await db.voiceNotes.where("photoId").equals(photo.id).sortBy("created");
+        const notes = await db.voiceNotes.where("photoId").equals(photo.id).filter(x => !x.deleted).sortBy("created");
         list.replaceChildren();
         for (const n of notes) {
-          const url = URL.createObjectURL(n.blob);
+          const url = URL.createObjectURL(new Blob([n.data], { type: n.mimeType }));
           objectUrls.push(url);
           list.append(el("div", {},
             el("audio", { controls: "", src: url, preload: "metadata" }),
-            el("div", { class: "muted" }, fmtDuration(n.duration) + " - " + fmtKB(n.blob.size)),
+            el("div", { class: "muted" }, fmtDuration(n.duration) + " - " + fmtKB(n.size)),
             el("button", { class: "link-btn", onclick: async () => {
               if (!confirm("Delete this voice note?")) return;
-              await db.voiceNotes.delete(n.id);
+              await softDelete("voiceNote", n.id);
               renderNotes();
             } }, "Delete voice note")
           ));
@@ -281,13 +359,16 @@
         try {
           await startRecording(async (blob, seconds) => {
             resetButton();
-            await db.voiceNotes.add({
+            await saveNew(db.voiceNotes, {
               photoId: photo.id,
-              blob,
+              data: await blob.arrayBuffer(),   // the audio's bytes
+              size: blob.size,
               mimeType: blob.type,     // remember the format with each recording
-              duration: seconds,       // our own timer; browser-made files often lack this
-              created: new Date().toISOString()
+              duration: seconds        // our own timer; browser-made files often lack this
             });
+            // Short pause: iPhones need a moment to switch from "recording"
+            // back to "playback" mode, or the first playback can be silent.
+            await new Promise(r => setTimeout(r, 400));
             renderNotes();
           });
           const started = Date.now();
@@ -305,20 +386,6 @@
 
       renderNotes();
       return el("div", { class: "voice" }, recBtn, status, list);
-    }
-
-    // ---- Deleting a photo must also delete its voice notes ----
-    async function deletePhoto(photoId) {
-      await db.transaction("rw", db.photos, db.voiceNotes, async () => {
-        await db.voiceNotes.where("photoId").equals(photoId).delete();
-        await db.photos.delete(photoId);
-      });
-    }
-
-    async function deletePhotosInSection(sectionId) {
-      const photoIds = await db.photos.where("sectionId").equals(sectionId).primaryKeys();
-      await db.voiceNotes.where("photoId").anyOf(photoIds).delete();
-      await db.photos.where("sectionId").equals(sectionId).delete();
     }
 
     // ===============================================================
@@ -361,16 +428,16 @@
       async function create() {
         const name = nameInput.value.trim();
         if (!name) return;
-        const id = await db.assessments.add({ name, created: new Date().toISOString() });
+        const id = await saveNew(db.assessments, { name });
         location.hash = "#/a/" + id;   // jump straight into the new assessment
       }
 
       const list = el("ul", { class: "items" });
-      const all = await db.assessments.orderBy("created").reverse().toArray();
+      const all = await db.assessments.orderBy("created").reverse().filter(a => !a.deleted).toArray();
       if (all.length === 0) list.append(el("li", {}, "No assessments yet."));
 
       for (const a of all) {
-        const sectionCount = await db.sections.where("assessmentId").equals(a.id).count();
+        const sectionCount = await db.sections.where("assessmentId").equals(a.id).filter(x => !x.deleted).count();
         list.append(el("li", {},
           el("a", { href: "#/a/" + a.id }, a.name),
           el("div", { class: "muted" }, fmtDate(a.created) + " - " + sectionCount + " section(s)"),
@@ -388,36 +455,30 @@
 
     async function deleteAssessment(a) {
       if (!confirm("Delete '" + a.name + "' and everything in it?")) return;
-      // A transaction means "do all of this or none of it".
-      await db.transaction("rw", db.assessments, db.sections, db.photos, db.voiceNotes, async () => {
-        const sections = await db.sections.where("assessmentId").equals(a.id).toArray();
-        for (const s of sections) await deletePhotosInSection(s.id);
-        await db.sections.where("assessmentId").equals(a.id).delete();
-        await db.assessments.delete(a.id);
-      });
+      await softDelete("assessment", a.id);
       showHome();
     }
 
     // ---- Assessment: sections ----
     async function showAssessment(id) {
       const assessment = await db.assessments.get(id);
-      if (!assessment) { location.hash = "#/"; return; }
+      if (!assessment || assessment.deleted) { location.hash = "#/"; return; }
 
       const nameInput = el("input", { type: "text", placeholder: "Section, e.g. Stairwell B, Main electrical panel" });
 
       async function addSection() {
         const name = nameInput.value.trim();
         if (!name) return;
-        const sid = await db.sections.add({ assessmentId: id, name, created: new Date().toISOString() });
+        const sid = await saveNew(db.sections, { assessmentId: id, name });
         location.hash = "#/s/" + sid;  // straight into the new section, ready for photos
       }
 
       const list = el("ul", { class: "items" });
-      const sections = await db.sections.where("assessmentId").equals(id).sortBy("created");
+      const sections = await db.sections.where("assessmentId").equals(id).filter(x => !x.deleted).sortBy("created");
       if (sections.length === 0) list.append(el("li", {}, "No sections yet."));
 
       for (const s of sections) {
-        const photoCount = await db.photos.where("sectionId").equals(s.id).count();
+        const photoCount = await db.photos.where("sectionId").equals(s.id).filter(x => !x.deleted).count();
         list.append(el("li", {},
           el("a", { href: "#/s/" + s.id }, s.name),
           el("div", { class: "muted" }, photoCount + " photo(s)"),
@@ -437,17 +498,14 @@
 
     async function deleteSection(s) {
       if (!confirm("Delete '" + s.name + "' and its photos?")) return;
-      await db.transaction("rw", db.sections, db.photos, db.voiceNotes, async () => {
-        await deletePhotosInSection(s.id);
-        await db.sections.delete(s.id);
-      });
+      await softDelete("section", s.id);
       showAssessment(s.assessmentId);
     }
 
     // ---- Section: photos ----
     async function showSection(id) {
       const section = await db.sections.get(id);
-      if (!section) { location.hash = "#/"; return; }
+      if (!section || section.deleted) { location.hash = "#/"; return; }
 
       const status = el("p", { class: "muted" }, "");
 
@@ -461,14 +519,14 @@
         status.textContent = "Processing photo...";
         try {
           const { blob, width, height } = await resizeImage(file);
-          await db.photos.add({
+          await saveNew(db.photos, {
             sectionId: id,
-            created: new Date().toISOString(),
-            blob, width, height,
-            // Placeholders for later steps, so we won't need to restructure:
-            tags: [],
-            note: "",
-            voiceNoteId: null
+            data: await blob.arrayBuffer(),   // the photo's bytes
+            mimeType: blob.type,
+            size: blob.size,
+            width, height,
+            tags: [],       // filled in by the tag buttons
+            note: ""        // the typed note
           });
           status.textContent = "Saved (" + fmtKB(file.size) + " reduced to " + fmtKB(blob.size) + ").";
         } catch (err) {
@@ -484,22 +542,22 @@
       async function renderPhotos() {
         releaseUrls();
         grid.replaceChildren();
-        const photos = await db.photos.where("sectionId").equals(id).sortBy("created");
+        const photos = await db.photos.where("sectionId").equals(id).filter(x => !x.deleted).sortBy("created");
         const allTags = await getAllTags();
         if (photos.length === 0) grid.append(el("li", {}, "No photos yet."));
 
         for (const p of photos) {
-          const url = URL.createObjectURL(p.blob);
+          const url = URL.createObjectURL(new Blob([p.data], { type: p.mimeType }));
           objectUrls.push(url);
           grid.append(el("li", {},
             el("img", { src: url, alt: "Photo taken " + fmtDate(p.created) }),
-            el("div", { class: "muted" }, fmtDate(p.created) + " - " + fmtKB(p.blob.size)),
+            el("div", { class: "muted" }, fmtDate(p.created) + " - " + fmtKB(p.size)),
             tagPanel(p, allTags),
             noteBox(p),
             voicePanel(p),
             el("button", { class: "link-btn", onclick: async () => {
               if (!confirm("Delete this photo?")) return;
-              await deletePhoto(p.id);
+              await softDelete("photo", p.id);
               renderPhotos();
             } }, "Delete")
           ));
@@ -526,7 +584,7 @@
       releaseUrls();
       const parts = location.hash.replace(/^#\/?/, "").split("/");   // "a/5" -> ["a", "5"]
       const [kind, rawId] = parts;
-      const id = Number(rawId);
+      const id = rawId;   // IDs are text (UUIDs) now, so no Number()
 
       try {
         if (kind === "a" && id) await showAssessment(id);
@@ -536,6 +594,7 @@
         console.error(err);
         app.replaceChildren(el("p", {}, "Something went wrong: " + err.message));
       }
+      updateSyncBadge();
     }
 
     // Register the service worker so the app can open offline.
