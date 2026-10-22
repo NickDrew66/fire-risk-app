@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Fire Risk Assessor - Step 2</title>
+  <title>Fire Risk Assessor - Step 3</title>
 
   <style>
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 16px; line-height: 1.4; }
@@ -20,6 +20,13 @@
     .grid img { width: 100%; height: auto; display: block; border-radius: 4px; }
     .back { display: inline-block; margin-bottom: 8px; }
     #photo-input { display: none; } /* the label below acts as the visible button */
+
+    /* Tags */
+    details { margin: 8px 0; }
+    summary { cursor: pointer; padding: 6px 0; font-size: 0.95rem; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+    .chip { margin: 0; padding: 8px 12px; border: 1px solid #767676; border-radius: 999px; background: #fff; font-size: 0.9rem; }
+    .chip[aria-pressed="true"] { background: #1a4f8b; border-color: #1a4f8b; color: #fff; }
   </style>
 </head>
 <body>
@@ -42,6 +49,17 @@
       assessments: "++id, created",
       sections:    "++id, assessmentId, created",
       photos:      "++id, sectionId, created"
+    });
+
+    // Version 2 (step 3). Whenever you change the structure you add a new
+    // version number; Dexie upgrades existing data automatically.
+    //   "*tags" on photos = index every item in the tags list, so we can
+    //                       later ask "show all photos tagged fire door".
+    //   customTags        = tags the assessor has invented, so they appear
+    //                       in the pick-list from then on.
+    db.version(2).stores({
+      photos:     "++id, sectionId, created, *tags",
+      customTags: "name"
     });
 
     // Ask the browser not to delete our data when the device is short of
@@ -79,7 +97,71 @@
     }
 
     // ===============================================================
-    // 3. IMAGE RESIZING
+    // 3. TAGS
+    // A starter pick-list of tappable tags, plus any custom tags the
+    // assessor has added. Swap these defaults for the categories he
+    // actually uses in his reports.
+    // ===============================================================
+    const DEFAULT_TAGS = [
+      "fire door", "emergency lighting", "fire extinguisher", "escape route",
+      "compartmentation", "alarm / detection", "signage", "electrical", "housekeeping"
+    ];
+
+    // Defaults first, then any custom tags saved earlier.
+    async function getAllTags() {
+      const custom = await db.customTags.toArray();
+      const extras = custom.map(t => t.name).filter(n => !DEFAULT_TAGS.includes(n));
+      return [...DEFAULT_TAGS, ...extras];
+    }
+
+    // Builds the collapsible tag area for one photo.
+    // A Set is a list that can't hold duplicates - ideal for tags.
+    function tagPanel(photo, allTags) {
+      const selected = new Set(photo.tags || []);
+      const summary = el("summary", {});
+      const chipBox = el("div", { class: "chips" });
+      const customInput = el("input", { type: "text", placeholder: "Add your own tag" });
+
+      async function saveSelected() {
+        await db.photos.update(photo.id, { tags: [...selected] });
+      }
+
+      // Redraws the summary line and the row of buttons.
+      function refresh() {
+        summary.textContent = selected.size ? "Tags: " + [...selected].join(", ") : "Add tags";
+        chipBox.replaceChildren();
+        for (const tag of allTags) {
+          chipBox.append(el("button", {
+            class: "chip",
+            "aria-pressed": String(selected.has(tag)),   // the CSS colours it when "true"
+            onclick: async () => {
+              if (selected.has(tag)) selected.delete(tag); else selected.add(tag);
+              await saveSelected();
+              refresh();
+            }
+          }, tag));
+        }
+      }
+
+      async function addCustom() {
+        const name = customInput.value.trim().toLowerCase();
+        if (!name) return;
+        if (!allTags.includes(name)) {
+          await db.customTags.put({ name });   // remember it for future photos
+          allTags.push(name);
+        }
+        selected.add(name);
+        await saveSelected();
+        customInput.value = "";
+        refresh();
+      }
+
+      refresh();
+      return el("details", {}, summary, chipBox, customInput, el("button", { onclick: addCustom }, "Add tag"));
+    }
+
+    // ===============================================================
+    // 3b. IMAGE RESIZING
     // Takes the full phone photo, scales it down so the longest side
     // is 1600px, and re-saves it as a JPEG at 75% quality.
     // A 5MB photo usually becomes 200-500KB.
@@ -242,6 +324,7 @@
         releaseUrls();
         grid.replaceChildren();
         const photos = await db.photos.where("sectionId").equals(id).sortBy("created");
+        const allTags = await getAllTags();
         if (photos.length === 0) grid.append(el("li", {}, "No photos yet."));
 
         for (const p of photos) {
@@ -250,6 +333,7 @@
           grid.append(el("li", {},
             el("img", { src: url, alt: "Photo taken " + fmtDate(p.created) }),
             el("div", { class: "muted" }, fmtDate(p.created) + " - " + fmtKB(p.blob.size)),
+            tagPanel(p, allTags),
             el("button", { class: "link-btn", onclick: async () => {
               if (!confirm("Delete this photo?")) return;
               await db.photos.delete(p.id);
