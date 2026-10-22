@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Fire Risk Assessor - Step 3</title>
+  <title>Fire Risk Assessor - Step 4</title>
 
   <style>
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 16px; line-height: 1.4; }
@@ -27,12 +27,19 @@
     .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
     .chip { margin: 0; padding: 8px 12px; border: 1px solid #767676; border-radius: 999px; background: #fff; font-size: 0.9rem; }
     .chip[aria-pressed="true"] { background: #1a4f8b; border-color: #1a4f8b; color: #fff; }
+
+    /* Notes and voice */
+    textarea { font: inherit; width: 100%; box-sizing: border-box; padding: 8px; min-height: 70px; margin-top: 6px; }
+    .voice { margin-top: 8px; }
+    .voice audio { width: 100%; margin-top: 6px; }
+    .recording { background: #b00020; border-color: #b00020; color: #fff; }
   </style>
 </head>
 <body>
   <main id="app"></main>
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/dexie/3.2.7/dexie.min.js"></script>
+  <!-- Dexie now loads from your own folder (see the PowerShell download command) -->
+  <script src="dexie.min.js"></script>
   <script>
     // ===============================================================
     // 1. DATABASE
@@ -44,6 +51,11 @@
     //                 "sectionId" says which section it belongs to
     // New database name, so it doesn't clash with step 1's data.
     // ===============================================================
+    if (typeof Dexie === "undefined") {
+      document.getElementById("app").textContent =
+        "dexie.min.js was not found. Download it into the same folder as this page.";
+      throw new Error("Dexie missing");
+    }
     const db = new Dexie("fireRiskAssessor");
     db.version(1).stores({
       assessments: "++id, created",
@@ -60,6 +72,12 @@
     db.version(2).stores({
       photos:     "++id, sectionId, created, *tags",
       customTags: "name"
+    });
+
+    // Version 3 (step 4): voice notes. Each one points at its photo with
+    // "photoId". The audio itself is stored as a blob, like the photos.
+    db.version(3).stores({
+      voiceNotes: "++id, photoId, created"
     });
 
     // Ask the browser not to delete our data when the device is short of
@@ -161,7 +179,141 @@
     }
 
     // ===============================================================
-    // 3b. IMAGE RESIZING
+    // 3b. TYPED NOTE AND VOICE NOTES
+    // ===============================================================
+
+    // Seconds -> "m:ss"
+    function fmtDuration(seconds) {
+      const s = Math.round(seconds);
+      return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0");
+    }
+
+    // Different browsers record in different formats (Chrome/Android: WebM,
+    // Safari/iPhone: MP4). Ask the browser which one it supports.
+    function pickMimeType() {
+      const options = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+      if (!window.MediaRecorder) return "";
+      return options.find(t => MediaRecorder.isTypeSupported(t)) || "";
+    }
+
+    // Only one recording at a time. Kept here so we can stop it if the
+    // user navigates away.
+    let activeRecorder = null;
+
+    // Opens the microphone and starts recording. When stopped, calls
+    // onDone(blob, seconds) with the finished audio.
+    async function startRecording(onDone) {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const mimeType = pickMimeType();
+      const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+      const chunks = [];
+      const startedAt = Date.now();
+
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());   // switches the microphone off
+        activeRecorder = null;
+        const type = recorder.mimeType || mimeType || "audio/webm";
+        onDone(new Blob(chunks, { type }), (Date.now() - startedAt) / 1000);
+      };
+
+      recorder.start();
+      activeRecorder = recorder;
+      return recorder;
+    }
+
+    // Typed note: saved when the box loses focus.
+    function noteBox(photo) {
+      const box = el("textarea", { placeholder: "Typed note (optional)" });
+      box.value = photo.note || "";
+      box.addEventListener("change", () => db.photos.update(photo.id, { note: box.value.trim() }));
+      return box;
+    }
+
+    // Record button plus the list of saved voice notes for one photo.
+    function voicePanel(photo) {
+      const list = el("div", {});
+      const status = el("div", { class: "muted" });
+      const recBtn = el("button", { class: "btn" }, "Record voice note");
+      let timer = null;
+
+      async function renderNotes() {
+        const notes = await db.voiceNotes.where("photoId").equals(photo.id).sortBy("created");
+        list.replaceChildren();
+        for (const n of notes) {
+          const url = URL.createObjectURL(n.blob);
+          objectUrls.push(url);
+          list.append(el("div", {},
+            el("audio", { controls: "", src: url, preload: "metadata" }),
+            el("div", { class: "muted" }, fmtDuration(n.duration) + " - " + fmtKB(n.blob.size)),
+            el("button", { class: "link-btn", onclick: async () => {
+              if (!confirm("Delete this voice note?")) return;
+              await db.voiceNotes.delete(n.id);
+              renderNotes();
+            } }, "Delete voice note")
+          ));
+        }
+      }
+
+      function resetButton() {
+        clearInterval(timer);
+        recBtn.textContent = "Record voice note";
+        recBtn.classList.remove("recording");
+      }
+
+      recBtn.addEventListener("click", async () => {
+        if (activeRecorder) {
+          // Already recording. If it's this button's recording, stop it.
+          if (recBtn.classList.contains("recording")) activeRecorder.stop();
+          else status.textContent = "Stop the other recording first.";
+          return;
+        }
+        status.textContent = "";
+        try {
+          await startRecording(async (blob, seconds) => {
+            resetButton();
+            await db.voiceNotes.add({
+              photoId: photo.id,
+              blob,
+              mimeType: blob.type,     // remember the format with each recording
+              duration: seconds,       // our own timer; browser-made files often lack this
+              created: new Date().toISOString()
+            });
+            renderNotes();
+          });
+          const started = Date.now();
+          recBtn.classList.add("recording");
+          recBtn.textContent = "Stop recording (0:00)";
+          timer = setInterval(() => {
+            recBtn.textContent = "Stop recording (" + fmtDuration((Date.now() - started) / 1000) + ")";
+          }, 500);
+        } catch (err) {
+          console.error(err);
+          status.textContent = "Can't use the microphone: " + err.message +
+            " (Allow microphone access, and note the page must be on HTTPS or localhost.)";
+        }
+      });
+
+      renderNotes();
+      return el("div", { class: "voice" }, recBtn, status, list);
+    }
+
+    // ---- Deleting a photo must also delete its voice notes ----
+    async function deletePhoto(photoId) {
+      await db.transaction("rw", db.photos, db.voiceNotes, async () => {
+        await db.voiceNotes.where("photoId").equals(photoId).delete();
+        await db.photos.delete(photoId);
+      });
+    }
+
+    async function deletePhotosInSection(sectionId) {
+      const photoIds = await db.photos.where("sectionId").equals(sectionId).primaryKeys();
+      await db.voiceNotes.where("photoId").anyOf(photoIds).delete();
+      await db.photos.where("sectionId").equals(sectionId).delete();
+    }
+
+    // ===============================================================
+    // 3c. IMAGE RESIZING
     // Takes the full phone photo, scales it down so the longest side
     // is 1600px, and re-saves it as a JPEG at 75% quality.
     // A 5MB photo usually becomes 200-500KB.
@@ -228,9 +380,9 @@
     async function deleteAssessment(a) {
       if (!confirm("Delete '" + a.name + "' and everything in it?")) return;
       // A transaction means "do all of this or none of it".
-      await db.transaction("rw", db.assessments, db.sections, db.photos, async () => {
+      await db.transaction("rw", db.assessments, db.sections, db.photos, db.voiceNotes, async () => {
         const sections = await db.sections.where("assessmentId").equals(a.id).toArray();
-        for (const s of sections) await db.photos.where("sectionId").equals(s.id).delete();
+        for (const s of sections) await deletePhotosInSection(s.id);
         await db.sections.where("assessmentId").equals(a.id).delete();
         await db.assessments.delete(a.id);
       });
@@ -276,8 +428,8 @@
 
     async function deleteSection(s) {
       if (!confirm("Delete '" + s.name + "' and its photos?")) return;
-      await db.transaction("rw", db.sections, db.photos, async () => {
-        await db.photos.where("sectionId").equals(s.id).delete();
+      await db.transaction("rw", db.sections, db.photos, db.voiceNotes, async () => {
+        await deletePhotosInSection(s.id);
         await db.sections.delete(s.id);
       });
       showAssessment(s.assessmentId);
@@ -334,9 +486,11 @@
             el("img", { src: url, alt: "Photo taken " + fmtDate(p.created) }),
             el("div", { class: "muted" }, fmtDate(p.created) + " - " + fmtKB(p.blob.size)),
             tagPanel(p, allTags),
+            noteBox(p),
+            voicePanel(p),
             el("button", { class: "link-btn", onclick: async () => {
               if (!confirm("Delete this photo?")) return;
-              await db.photos.delete(p.id);
+              await deletePhoto(p.id);
               renderPhotos();
             } }, "Delete")
           ));
@@ -359,6 +513,7 @@
     // Reads the address after the # and shows the matching screen.
     // ===============================================================
     async function route() {
+      if (activeRecorder) activeRecorder.stop();   // saves it and switches the mic off
       releaseUrls();
       const parts = location.hash.replace(/^#\/?/, "").split("/");   // "a/5" -> ["a", "5"]
       const [kind, rawId] = parts;
