@@ -3,7 +3,16 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Fire Risk Assessor - Step 4</title>
+  <title>Fire Risk Assessor</title>
+
+  <!-- Install / home-screen support -->
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#b3261e">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Fire Risk">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
 
   <style>
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 16px; line-height: 1.4; }
@@ -527,6 +536,14 @@
         console.error(err);
         app.replaceChildren(el("p", {}, "Something went wrong: " + err.message));
       }
+    }
+
+    // Register the service worker so the app can open offline.
+    // Only works over HTTPS (or localhost), not from a file on disk.
+    if ("serviceWorker" in navigator) {
+      window.addEventListener("load", () => {
+        navigator.serviceWorker.register("sw.js").catch(err => console.error("Service worker failed:", err));
+      });
     }
 
     window.addEventListener("hashchange", route);
