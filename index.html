@@ -309,6 +309,57 @@
       return recorder;
     }
 
+    // ---------------------------------------------------------------
+    // AUDIO PLAYBACK HELPERS (iPhone workarounds)
+    // Symptom: the first voice note played after the app opens is silent,
+    // and later plays work. These two things try to get round that.
+    // ---------------------------------------------------------------
+    const SHOW_AUDIO_DEBUG   = true;   // small status line under each player; set false when fixed
+    const FIRST_PLAY_RESTART = true;   // restart the very first playback once it begins; set false to test without
+
+    // 1. On the first tap anywhere, play a split-second silent sound. This
+    //    "wakes up" the phone's audio output before any real voice note plays.
+    const SILENT_WAV = "data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YSADAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgA==";
+    let audioUnlocked = false;
+    function unlockAudio() {
+      if (audioUnlocked) return;
+      audioUnlocked = true;
+      try { new Audio(SILENT_WAV).play().catch(() => {}); } catch (e) { /* ignore */ }
+    }
+    document.addEventListener("touchend", unlockAudio, { capture: true });
+    document.addEventListener("click", unlockAudio, { capture: true });
+
+    // 2. The player itself. Loads the whole clip up front, and (optionally)
+    //    restarts the first playback of the session, which is the one that
+    //    comes out silent on some iPhones.
+    let firstPlayDone = false;
+    function makeAudioPlayer(url) {
+      const audio = el("audio", { controls: "", src: url, preload: "auto" });
+      const debug = el("div", { class: "muted" });
+      const events = [];
+
+      ["loadedmetadata", "canplay", "play", "playing", "pause", "waiting", "stalled", "error", "ended"].forEach(name => {
+        audio.addEventListener(name, () => {
+          events.push(name === "error" ? "error(" + (audio.error ? audio.error.code : "?") + ")" : name);
+          const len = isFinite(audio.duration) ? audio.duration.toFixed(1) + "s" : "unknown";
+          debug.textContent = "audio: " + events.slice(-6).join(" > ") + " | length " + len;
+        });
+      });
+
+      if (FIRST_PLAY_RESTART) {
+        audio.addEventListener("playing", () => {
+          if (firstPlayDone) return;
+          firstPlayDone = true;
+          audio.pause();
+          audio.currentTime = 0;
+          audio.play().catch(() => {});
+        });
+      }
+
+      if (!SHOW_AUDIO_DEBUG) debug.style.display = "none";
+      return el("div", {}, audio, debug);
+    }
+
     // Typed note: saved when the box loses focus.
     function noteBox(photo) {
       const box = el("textarea", { placeholder: "Typed note (optional)" });
@@ -331,7 +382,7 @@
           const url = URL.createObjectURL(new Blob([n.data], { type: n.mimeType }));
           objectUrls.push(url);
           list.append(el("div", {},
-            el("audio", { controls: "", src: url, preload: "metadata" }),
+            makeAudioPlayer(url),
             el("div", { class: "muted" }, fmtDuration(n.duration) + " - " + fmtKB(n.size)),
             el("button", { class: "link-btn", onclick: async () => {
               if (!confirm("Delete this voice note?")) return;

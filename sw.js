@@ -5,7 +5,7 @@
 // ===================================================================
 
 // Change this name (v1 -> v2) whenever you add or remove files in ASSETS.
-const CACHE = "fire-risk-v3";
+const CACHE = "fire-risk-v4";
 
 // Everything the app needs in order to open with no connection.
 // Paths are relative, so this works from a sub-folder like /fire-risk-app/.
